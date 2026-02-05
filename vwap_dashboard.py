@@ -33,8 +33,17 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
+
+# =============================================================================
+# 한국 시간대 설정 (UTC+9)
+# =============================================================================
+KST = timezone(timedelta(hours=9))
+
+def get_kst_now() -> datetime:
+    """한국 시간(KST) 반환"""
+    return datetime.now(KST)
 
 # =============================================================================
 # 페이지 설정
@@ -251,7 +260,7 @@ def get_current_bucket(current_time: str = None) -> Tuple[str, str]:
         (start_time, end_time) tuple
     """
     if current_time is None:
-        now = datetime.now()
+        now = get_kst_now()
         current_time = now.strftime('%H:%M')
 
     buckets = [
@@ -470,7 +479,7 @@ def main():
 
         st.markdown("---")
         st.markdown("### ⏰ 현재 시간")
-        now = datetime.now()
+        now = get_kst_now()
         st.write(f"**{now.strftime('%H:%M:%S')}**")
         current_bucket = get_current_bucket()
         st.write(f"현재 구간: {current_bucket[0]} - {current_bucket[1]}")
@@ -534,9 +543,9 @@ def main():
 
                 if use_current_time:
                     current_time = None
-                    time_display = datetime.now().strftime('%H:%M')
+                    time_display = get_kst_now().strftime('%H:%M')
                 else:
-                    time_input = st.time_input("시간 지정", value=datetime.now().time())
+                    time_input = st.time_input("시간 지정", value=get_kst_now().time())
                     current_time = time_input.strftime('%H:%M')
                     time_display = current_time
 
