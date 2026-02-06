@@ -362,9 +362,9 @@ def redistribute_remaining_weight(
     df_result.columns = ['시작시간', '종료시간', '기존비율', '재배분비율', '재배분누적']
 
     # 반올림
-    df_result['기존비율'] = df_result['기존비율'].round(1)
-    df_result['재배분비율'] = df_result['재배분비율'].round(1)
-    df_result['재배분누적'] = df_result['재배분누적'].round(1)
+    df_result['기존비율'] = df_result['기존비율'].round(0).astype(int)
+    df_result['재배분비율'] = df_result['재배분비율'].round(0).astype(int)
+    df_result['재배분누적'] = df_result['재배분누적'].round(0).astype(int)
 
     return df_result
 
@@ -388,8 +388,8 @@ def render_schedule_table(df: pd.DataFrame, title: str = "VWAP 스케줄"):
     display_df.columns = ['시작시간', '종료시간', '비율(%)', '누적체결률(%)']
 
     # 비율 포맷팅
-    display_df['비율(%)'] = display_df['비율(%)'].round(1)
-    display_df['누적체결률(%)'] = display_df['누적체결률(%)'].round(1)
+    display_df['비율(%)'] = display_df['비율(%)'].round(0).astype(int)
+    display_df['누적체결률(%)'] = display_df['누적체결률(%)'].round(0).astype(int)
 
     st.dataframe(
         display_df,
