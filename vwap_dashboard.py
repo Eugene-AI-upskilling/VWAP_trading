@@ -33,8 +33,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import os
+import re
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 # =============================================================================
 # 한국 시간대 설정 (UTC+9)
@@ -213,9 +214,30 @@ def create_sample_data() -> pd.DataFrame:
 # 비즈니스 로직 함수
 # =============================================================================
 
+def normalize_time_str(time_str: str) -> str:
+    """
+    시간 문자열을 HH:MM 형식으로 정규화
+
+    Args:
+        time_str: 시간 문자열 (예: "9:00", "09:00", "9:0")
+
+    Returns:
+        정규화된 시간 문자열 (예: "09:00")
+    """
+    if not time_str or ':' not in str(time_str):
+        return time_str
+
+    parts = str(time_str).strip().split(':')
+    if len(parts) >= 2:
+        hour = parts[0].zfill(2)
+        minute = parts[1].zfill(2)
+        return f"{hour}:{minute}"
+    return time_str
+
+
 def filter_by_ticker(df: pd.DataFrame, search_term: str) -> Optional[pd.DataFrame]:
     """
-    종목코드 또는 종목명으로 필터링
+    종목코드 또는 종목명으로 필터링 (단일 종목)
 
     Args:
         df: 전체 스케줄 DataFrame
@@ -223,10 +245,6 @@ def filter_by_ticker(df: pd.DataFrame, search_term: str) -> Optional[pd.DataFram
 
     Returns:
         필터링된 DataFrame 또는 None (검색 결과 없음)
-
-    Notes:
-        - 종목코드: 정확히 일치
-        - 종목명: 부분 일치 (대소문자 무시)
     """
     if not search_term:
         return None
@@ -244,9 +262,51 @@ def filter_by_ticker(df: pd.DataFrame, search_term: str) -> Optional[pd.DataFram
     if result.empty:
         return None
 
-    # 첫 번째 매칭 종목만 반환 (여러 종목 매칭 시)
     first_ticker = result['ticker'].iloc[0]
     return df[df['ticker'] == first_ticker].copy()
+
+
+def filter_by_multiple_tickers(df: pd.DataFrame, search_terms: str) -> List[Tuple[str, str, pd.DataFrame]]:
+    """
+    여러 종목코드/종목명으로 필터링 (최대 4종목)
+
+    Args:
+        df: 전체 스케줄 DataFrame
+        search_terms: 검색어들 (쉼표, 공백으로 구분)
+
+    Returns:
+        [(ticker, name, DataFrame), ...] 리스트 (최대 4개)
+    """
+    if not search_terms:
+        return []
+
+    # 구분자로 분리 (쉼표, 공백, 줄바꿈)
+    terms = re.split(r'[,\s\n]+', search_terms.strip())
+    terms = [t.strip() for t in terms if t.strip()]
+
+    results = []
+    found_tickers = set()
+
+    for term in terms:
+        if len(results) >= 4:
+            break
+
+        # 종목코드로 검색
+        mask_code = df['ticker'] == term
+        # 종목명으로 검색
+        mask_name = df['name'].str.contains(term, case=False, na=False)
+
+        matched = df[mask_code | mask_name]
+
+        if not matched.empty:
+            ticker = matched['ticker'].iloc[0]
+            if ticker not in found_tickers:
+                found_tickers.add(ticker)
+                name = matched['name'].iloc[0]
+                stock_df = df[df['ticker'] == ticker].copy()
+                results.append((ticker, name, stock_df))
+
+    return results
 
 
 def get_current_bucket(current_time: str = None) -> Tuple[str, str]:
@@ -262,6 +322,8 @@ def get_current_bucket(current_time: str = None) -> Tuple[str, str]:
     if current_time is None:
         now = get_kst_now()
         current_time = now.strftime('%H:%M')
+    else:
+        current_time = normalize_time_str(current_time)
 
     buckets = [
         ('08:30', '09:00'),
@@ -292,34 +354,102 @@ def get_current_bucket(current_time: str = None) -> Tuple[str, str]:
         return ('15:00', '15:30')
 
 
+def apply_twap_cap_with_carry(
+    weights: pd.Series,
+    cap: float = 20.0
+) -> Tuple[pd.Series, Optional[str]]:
+    """
+    TWAP 상한(cap) 적용 - 초과분을 이후 구간으로 이월
+
+    Args:
+        weights: 각 bucket의 비중 (% 단위)
+        cap: 최대 비중 제한 (기본값 20%)
+
+    Returns:
+        (조정된 weights Series, 경고 메시지 또는 None)
+    """
+    if weights.empty:
+        return weights, None
+
+    result = weights.copy().astype(float)
+    n = len(result)
+    warning_msg = None
+    total_original = result.sum()
+
+    max_iterations = n * 2
+
+    for iteration in range(max_iterations):
+        excess_total = 0.0
+        has_excess = False
+
+        for i in range(n):
+            if result.iloc[i] > cap:
+                excess = result.iloc[i] - cap
+                result.iloc[i] = cap
+                excess_total += excess
+                has_excess = True
+
+        if not has_excess or excess_total < 0.001:
+            break
+
+        remaining_indices = [i for i in range(n) if result.iloc[i] < cap]
+
+        if not remaining_indices:
+            current_sum = result.sum()
+            shortfall = total_original - current_sum
+            if shortfall > 0.01:
+                warning_msg = (
+                    f"[WARNING] {cap}% cap으로는 남은 비중을 모두 배정할 수 없습니다. "
+                    f"미배정 비중: {shortfall:.1f}%"
+                )
+            break
+
+        remaining_weights = [result.iloc[i] for i in remaining_indices]
+        remaining_sum = sum(remaining_weights)
+
+        if remaining_sum <= 0:
+            per_bucket = excess_total / len(remaining_indices)
+            for i in remaining_indices:
+                result.iloc[i] += per_bucket
+        else:
+            for i in remaining_indices:
+                ratio = result.iloc[i] / remaining_sum
+                result.iloc[i] += excess_total * ratio
+
+    final_sum = result.sum()
+    if abs(final_sum - total_original) > 0.01 and warning_msg is None:
+        diff = total_original - final_sum
+        result.iloc[-1] += diff
+
+    return result, warning_msg
+
+
 def redistribute_remaining_weight(
     df_schedule: pd.DataFrame,
     actual_filled_pct: float,
-    current_time: str = None
-) -> pd.DataFrame:
+    current_time: str = None,
+    apply_cap: bool = True,
+    cap_pct: float = 20.0
+) -> Tuple[pd.DataFrame, Optional[str]]:
     """
-    잔여 주문 재배분 계산
+    잔여 주문 재배분 계산 (TWAP cap 적용)
 
     Args:
         df_schedule: 종목의 VWAP 스케줄 DataFrame
         actual_filled_pct: 실제 체결률 (%, 0-100)
         current_time: 현재 시간 'HH:MM' (None이면 시스템 시간)
+        apply_cap: TWAP cap 적용 여부 (기본값 True)
+        cap_pct: 최대 비중 제한 (기본값 20%)
 
     Returns:
-        재배분된 스케줄 DataFrame
-        컬럼: start_time, end_time, original_weight, new_weight, new_cum_weight
-
-    Logic:
-        1. 현재 시간 이후 구간만 추출
-        2. 남은 비중 = 100% - actual_filled_pct
-        3. 남은 구간들의 기존 weight 비율 유지하며 재정규화
-
-    Example:
-        - 원래 남은 구간 weight 합 = 63%
-        - 실제 체결률 = 37%
-        - 각 구간의 new_weight = (기존 weight / 63) * (100 - 37)
+        (재배분된 스케줄 DataFrame, 경고 메시지 또는 None)
     """
     df = df_schedule.copy()
+    warning_msg = None
+
+    # 시간 문자열 정규화
+    df['start_time'] = df['start_time'].apply(normalize_time_str)
+    df['end_time'] = df['end_time'].apply(normalize_time_str)
 
     # 현재 bucket 확인
     current_bucket = get_current_bucket(current_time)
@@ -329,7 +459,7 @@ def redistribute_remaining_weight(
     df_remaining = df[df['start_time'] >= current_start].copy()
 
     if df_remaining.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), None
 
     # 원래 weight 합계
     original_remaining_sum = df_remaining['weight'].sum()
@@ -338,18 +468,21 @@ def redistribute_remaining_weight(
     remaining_to_fill = 100.0 - actual_filled_pct
 
     if remaining_to_fill <= 0:
-        # 이미 100% 체결
         df_remaining['new_weight'] = 0.0
         df_remaining['new_cum_weight'] = 100.0
     elif original_remaining_sum <= 0:
-        # 남은 구간 weight 합이 0 (예외 케이스)
         equal_weight = remaining_to_fill / len(df_remaining)
         df_remaining['new_weight'] = equal_weight
     else:
-        # 재정규화
         df_remaining['new_weight'] = (
             df_remaining['weight'] / original_remaining_sum * remaining_to_fill
         )
+
+    # TWAP cap 적용
+    if apply_cap and remaining_to_fill > 0:
+        weights_series = df_remaining['new_weight'].reset_index(drop=True)
+        capped_weights, warning_msg = apply_twap_cap_with_carry(weights_series, cap=cap_pct)
+        df_remaining['new_weight'] = capped_weights.values
 
     # 새 누적 체결률 계산
     df_remaining['new_cum_weight'] = actual_filled_pct + df_remaining['new_weight'].cumsum()
@@ -362,11 +495,11 @@ def redistribute_remaining_weight(
     df_result.columns = ['시작시간', '종료시간', '기존비율', '재배분비율', '재배분누적']
 
     # 반올림
-    df_result['기존비율'] = df_result['기존비율'].round(0).astype(int)
-    df_result['재배분비율'] = df_result['재배분비율'].round(0).astype(int)
-    df_result['재배분누적'] = df_result['재배분누적'].round(0).astype(int)
+    df_result['기존비율'] = df_result['기존비율'].round(1)
+    df_result['재배분비율'] = df_result['재배분비율'].round(1)
+    df_result['재배분누적'] = df_result['재배분누적'].round(1)
 
-    return df_result
+    return df_result, warning_msg
 
 
 # =============================================================================
@@ -386,6 +519,10 @@ def render_schedule_table(df: pd.DataFrame, title: str = "VWAP 스케줄"):
     # 표시용 DataFrame
     display_df = df[['start_time', 'end_time', 'weight', 'cum_weight']].copy()
     display_df.columns = ['시작시간', '종료시간', '비율(%)', '누적체결률(%)']
+
+    # 시간 정규화
+    display_df['시작시간'] = display_df['시작시간'].apply(normalize_time_str)
+    display_df['종료시간'] = display_df['종료시간'].apply(normalize_time_str)
 
     # 비율 포맷팅
     display_df['비율(%)'] = display_df['비율(%)'].round(0).astype(int)
@@ -485,47 +622,39 @@ def main():
         st.write(f"현재 구간: {current_bucket[0]} - {current_bucket[1]}")
 
     # ---------------------------------------------------------------------
-    # 기능 1: 종목 검색
+    # 기능 1: 종목 검색 (최대 4종목 동시)
     # ---------------------------------------------------------------------
     st.markdown("---")
-    st.markdown('<p class="sub-header">🔍 종목 검색</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">🔍 종목 검색 (최대 4종목)</p>', unsafe_allow_html=True)
 
     col1, col2 = st.columns([3, 1])
 
     with col1:
         search_term = st.text_input(
-            "종목코드 또는 종목명 입력",
-            placeholder="예: 005930 또는 삼성전자",
-            help="종목코드(6자리) 또는 종목명을 입력하세요"
+            "종목코드 또는 종목명 입력 (쉼표/공백으로 구분)",
+            placeholder="예: 005930, 000660 또는 삼성전자 SK하이닉스",
+            help="최대 4개 종목을 쉼표 또는 공백으로 구분하여 입력하세요"
         )
 
     with col2:
-        st.write("")  # 정렬용
+        st.write("")
         search_clicked = st.button("🔍 검색", use_container_width=True)
 
     # 검색 실행
     if search_term or search_clicked:
-        df_filtered = filter_by_ticker(df_schedule, search_term)
+        search_results = filter_by_multiple_tickers(df_schedule, search_term)
 
-        if df_filtered is not None:
-            ticker = df_filtered['ticker'].iloc[0]
-            name = df_filtered['name'].iloc[0]
-
-            st.success(f"**[{ticker}] {name}** 스케줄을 불러왔습니다.")
+        if search_results:
+            st.success(f"**{len(search_results)}개 종목** 스케줄을 불러왔습니다: " +
+                      ", ".join([f"[{t}] {n}" for t, n, _ in search_results]))
 
             # -----------------------------------------------------------------
-            # 기능 1 출력: 원본 스케줄
+            # 공통 설정: 체결률, 시간, TWAP cap
             # -----------------------------------------------------------------
             st.markdown("---")
-            render_schedule_table(df_filtered, f"📋 [{ticker}] {name} - VWAP 스케줄")
+            st.markdown('<p class="sub-header">✏️ 공통 설정</p>', unsafe_allow_html=True)
 
-            # -----------------------------------------------------------------
-            # 기능 2: 실제 체결률 입력
-            # -----------------------------------------------------------------
-            st.markdown("---")
-            st.markdown('<p class="sub-header">✏️ 실제 체결률 입력</p>', unsafe_allow_html=True)
-
-            col_input1, col_input2, col_input3 = st.columns([2, 2, 2])
+            col_input1, col_input2, col_input3, col_input4 = st.columns([2, 2, 2, 2])
 
             with col_input1:
                 actual_filled = st.number_input(
@@ -538,9 +667,7 @@ def main():
                 )
 
             with col_input2:
-                # 현재 시간 또는 수동 입력
                 use_current_time = st.checkbox("현재 시간 사용", value=True)
-
                 if use_current_time:
                     current_time = None
                     time_display = get_kst_now().strftime('%H:%M')
@@ -550,71 +677,98 @@ def main():
                     time_display = current_time
 
             with col_input3:
+                apply_twap_cap = st.checkbox("TWAP 제한 적용", value=True,
+                                             help="각 구간 최대 비중 제한")
+                if apply_twap_cap:
+                    cap_value = st.slider("최대 비중 (%)", 10, 50, 20, 5)
+                else:
+                    cap_value = 100.0
+
+            with col_input4:
                 st.write("")
                 calculate_clicked = st.button("📊 재배분 계산", use_container_width=True, type="primary")
 
-            # 계산 버튼 또는 체결률 변경 시 재계산
-            if calculate_clicked or actual_filled > 0:
+            # 요약 메트릭
+            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+            with col_m1:
+                st.metric("실제 체결률", f"{actual_filled:.1f}%")
+            with col_m2:
+                remaining = 100.0 - actual_filled
+                st.metric("잔여 비중", f"{remaining:.1f}%")
+            with col_m3:
+                st.metric("기준 시간", time_display)
+            with col_m4:
+                current_bucket = get_current_bucket(current_time)
+                st.metric("현재 구간", f"{current_bucket[0]}-{current_bucket[1]}")
 
-                # -----------------------------------------------------------------
-                # 기능 3 & 4: 잔여 주문 재배분 및 결과 출력
-                # -----------------------------------------------------------------
-                st.markdown("---")
-                st.markdown('<p class="sub-header">📊 재배분 결과</p>', unsafe_allow_html=True)
+            # -----------------------------------------------------------------
+            # 종목별 결과 표시 (2x2 그리드)
+            # -----------------------------------------------------------------
+            st.markdown("---")
+            st.markdown('<p class="sub-header">📊 종목별 VWAP 스케줄</p>', unsafe_allow_html=True)
 
-                # 요약 메트릭
-                col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+            # 2x2 그리드 레이아웃
+            n_stocks = len(search_results)
 
-                with col_m1:
-                    st.metric("실제 체결률", f"{actual_filled:.1f}%")
+            if n_stocks == 1:
+                cols = [st.columns(1)[0]]
+            elif n_stocks == 2:
+                cols = st.columns(2)
+            else:
+                row1 = st.columns(2)
+                row2 = st.columns(2)
+                cols = row1 + row2
 
-                with col_m2:
-                    remaining = 100.0 - actual_filled
-                    st.metric("잔여 비중", f"{remaining:.1f}%")
+            for idx, (ticker, name, df_filtered) in enumerate(search_results):
+                with cols[idx]:
+                    st.markdown(f"#### [{ticker}] {name}")
 
-                with col_m3:
-                    st.metric("기준 시간", time_display)
+                    # 원본 스케줄 (접기)
+                    with st.expander("원본 스케줄", expanded=False):
+                        display_df = df_filtered[['start_time', 'end_time', 'weight', 'cum_weight']].copy()
+                        display_df.columns = ['시작', '종료', '비율(%)', '누적(%)']
+                        st.dataframe(display_df, use_container_width=True, hide_index=True,
+                                    height=min(len(display_df) * 35 + 35, 300))
 
-                with col_m4:
-                    current_bucket = get_current_bucket(current_time)
-                    st.metric("현재 구간", f"{current_bucket[0]}-{current_bucket[1]}")
+                    # 재배분 계산
+                    if calculate_clicked or actual_filled > 0:
+                        df_redistribution, twap_warning = redistribute_remaining_weight(
+                            df_filtered,
+                            actual_filled,
+                            current_time,
+                            apply_cap=apply_twap_cap,
+                            cap_pct=cap_value
+                        )
 
-                # 재배분 계산
-                df_redistribution = redistribute_remaining_weight(
-                    df_filtered,
-                    actual_filled,
-                    current_time
-                )
+                        if twap_warning:
+                            st.warning(twap_warning, icon="⚠️")
 
-                if not df_redistribution.empty:
-                    st.markdown("##### 📋 재배분된 스케줄")
-                    render_redistribution_table(df_redistribution)
+                        if not df_redistribution.empty:
+                            st.markdown("**재배분 결과:**")
+                            st.dataframe(
+                                df_redistribution,
+                                use_container_width=True,
+                                hide_index=True,
+                                height=min(len(df_redistribution) * 35 + 35, 300)
+                            )
 
-                    # 복사용 포맷
-                    with st.expander("📋 복사용 텍스트 보기", expanded=False):
-                        render_copy_format(df_redistribution, ticker, name)
+                            # 검증
+                            total_new = df_redistribution['재배분비율'].sum()
+                            expected = 100.0 - actual_filled
 
-                    # 재배분 검증
-                    total_new = df_redistribution['재배분비율'].sum()
-                    expected = 100.0 - actual_filled
+                            if abs(total_new - expected) < 1:
+                                st.success(f"합계: {total_new:.1f}%")
+                            else:
+                                st.warning(f"합계: {total_new:.1f}% (예상: {expected:.1f}%)")
 
-                    if abs(total_new - expected) < 0.1:
-                        st.markdown(f"""
-                        <div class="success-box">
-                        ✅ <b>검증 완료</b><br>
-                        재배분 비율 합계: {total_new:.2f}% (예상: {expected:.2f}%)
-                        </div>
-                        """, unsafe_allow_html=True)
-                    else:
-                        st.markdown(f"""
-                        <div class="warning-box">
-                        ⚠️ <b>검증 필요</b><br>
-                        재배분 비율 합계: {total_new:.2f}% (예상: {expected:.2f}%)
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                else:
-                    st.warning("현재 시간 이후 남은 구간이 없습니다.")
+                            # 복사용 텍스트
+                            with st.expander("복사용 텍스트"):
+                                lines = [f"[{ticker}] {name}", "시간\t비율\t누적"]
+                                for _, row in df_redistribution.iterrows():
+                                    lines.append(f"{row['시작시간']}-{row['종료시간']}\t{row['재배분비율']}\t{row['재배분누적']}")
+                                st.code("\n".join(lines), language=None)
+                        else:
+                            st.info("남은 구간 없음")
 
         else:
             st.warning(f"'{search_term}'에 해당하는 종목을 찾을 수 없습니다.")
